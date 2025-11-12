@@ -17,6 +17,7 @@ from .utils import ATOMTYPE_MAPPING
 _DEFAULT_AD4_TYPE_MAP: Dict[str, str] = {
     "H": "H",
     "C": "C",
+    "A": "A",
     "N": "N",
     "O": "OA",
     "S": "S",
