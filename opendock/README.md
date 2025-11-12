@@ -31,6 +31,34 @@ Or install `OpenDock` package by using pip install from web:
     pip install opendock
 
 
+## Evaluating VinaSF directly from structure files
+
+The `vinasf_torch` package can read RDKit molecules and evaluate the Vina
+scoring function on new coordinates.  The snippet below shows how to load a
+`receptor.pdb` and `ligand.sdf` pair, construct the scoring function, and
+retrieve both the score and Cartesian gradient for the ligand heavy atoms.
+
+```
+from rdkit import Chem
+import torch
+
+from vinasf_torch import VinaSF
+
+receptor = Chem.MolFromPDBFile("receptor.pdb", removeHs=False)
+ligand = Chem.SDMolSupplier("ligand.sdf", removeHs=False)[0]
+
+vina = VinaSF.from_rdkit(receptor, ligand)
+
+# Use the current ligand coordinates or provide your own tensor with shape
+# (N, A, 3) for N poses and A heavy atoms.
+coords = vina.ligand.pose_heavy_atoms_coords.clone()
+score, gradient = vina.score_and_gradient(coords)
+
+print("Score per pose:", score)
+print("Gradient tensor:", gradient)
+```
+
+
 # Framework architecture
 
 # Applications

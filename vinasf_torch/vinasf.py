@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -114,7 +114,7 @@ class VinaSF:
             self.rec_index_to_series_dict = getattr(
                 receptor, "rec_index_to_series_dict", {}
             )
-            self.num_of_rec_ha = len(self.rec_heavy_atoms_xyz)
+            self.num_of_rec_ha = self.rec_heavy_atoms_xyz.size(-2)
         else:
             self.receptor = None
             self.rec_heavy_atoms_xyz = None
@@ -131,17 +131,66 @@ class VinaSF:
         self.dist: Optional[torch.Tensor] = None
         self.intra_dist: Optional[torch.Tensor] = None
 
+    @classmethod
+    def from_rdkit(
+        cls,
+        receptor_mol: Any,
+        ligand_mol: Any,
+        *,
+        receptor_conformer_id: int = 0,
+        ligand_conformer_id: int = 0,
+        atomtype_mapping: Optional[Dict[str, Any]] = None,
+        covalent_radii_dict: Optional[Dict[str, float]] = None,
+        vdw_radii_dict: Optional[Dict[str, float]] = None,
+    ) -> "VinaSF":
+        """Construct a :class:`VinaSF` instance from RDKit molecules.
+
+        Parameters
+        ----------
+        receptor_mol:
+            RDKit ``Chem.Mol`` instance representing the receptor.
+        ligand_mol:
+            RDKit ``Chem.Mol`` instance representing the ligand.
+        receptor_conformer_id:
+            Identifier of the conformer to extract receptor coordinates from.
+        ligand_conformer_id:
+            Identifier of the conformer to extract ligand coordinates from.
+
+        Returns
+        -------
+        VinaSF
+            Instance initialised with lightweight receptor/ligand adapters.
+        """
+
+        from .rdkit_adapter import RDKitLigandAdapter, RDKitReceptorAdapter
+
+        receptor = RDKitReceptorAdapter.from_mol(
+            receptor_mol,
+            conformer_id=receptor_conformer_id,
+            atomtype_mapping=atomtype_mapping,
+        )
+        ligand = RDKitLigandAdapter.from_mol(
+            ligand_mol,
+            conformer_id=ligand_conformer_id,
+            atomtype_mapping=atomtype_mapping,
+        )
+
+        return cls(
+            receptor=receptor,
+            ligand=ligand,
+            atomtype_mapping=atomtype_mapping,
+            covalent_radii_dict=covalent_radii_dict,
+            vdw_radii_dict=vdw_radii_dict,
+        )
+
     def generate_pldist_mtrx(self) -> torch.Tensor:
         if self.receptor is None or self.ligand is None:
             raise ValueError(
                 "Both receptor and ligand must be provided to compute distances."
             )
 
-        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz
-        if rec_heavy_atoms_xyz.dim() == 2:
-            rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.unsqueeze(0)
-        rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.expand(
-            len(self.ligand.pose_heavy_atoms_coords), -1, 3
+        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz.expand(
+            len(self.ligand.pose_heavy_atoms_coords), -1, -1
         )
 
         ligand_coords = self.ligand.pose_heavy_atoms_coords
@@ -773,29 +822,20 @@ class VinaSF:
 
         #t4 = time.time()
         #vina_intra_term=torch.tensor([[99.99]], requires_grad=True)
-        try:
-
-         self.generate_intra_mtrx()
-         #t8 = time.time()
-         # #flag=0
-         # #try:
-         self._prepare_data_intra()
-         #t9 = time.time()
-         # # except:
-         # #   flag=1
-         # # if flag==0:
-         vina_intra = VinaScoreCore(self.intra_vina_dist,
-                             self.intra_rec_lig_is_hydrophobic,
-                             self.intra_rec_lig_is_hbond,
-                             self.intra_rec_lig_atom_vdw_sum)
-         #
-         vina_intra_term = vina_intra.process()
-         #
-         vina_intra_term = vina_intra_term.reshape(-1, 1)
-         #print("11 intra",vina_intra_term)
-        except:
-            vina_intra_term = torch.tensor([[1.0]], requires_grad=True)
-            #vina_intra_term = self.cal_intra_repulsion().reshape(-1, 1)
+        vina_intra_term = torch.zeros_like(self.vina_inter_energy)
+        if self.lig_intra_interacting_pairs:
+            try:
+                self.generate_intra_mtrx()
+                self._prepare_data_intra()
+                vina_intra = VinaScoreCore(
+                    self.intra_vina_dist,
+                    self.intra_rec_lig_is_hydrophobic,
+                    self.intra_rec_lig_is_hbond,
+                    self.intra_rec_lig_atom_vdw_sum,
+                )
+                vina_intra_term = vina_intra.process().reshape(-1, 1)
+            except Exception:
+                vina_intra_term = torch.zeros_like(self.vina_inter_energy)
         # #print("11 self.vina_intra_energy",vina_intra_term)
         # #else:
         #vina_intra_term = self.cal_intra_repulsion().reshape(-1, 1)
@@ -839,6 +879,42 @@ class VinaSF:
         # print("cost time in calcuate  old  intra:", t88-t77)
         #print("score",(self.vina_inter_energy + vina_intra_term))
         return (self.vina_inter_energy + vina_intra_term)/ ( 1 + 0.05846 * (self.ligand.active_torsion + 0.5 * self.ligand.inactive_torsion))
+
+    def score_and_gradient(
+        self, ligand_coords: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the Vina score and gradient for the provided coordinates.
+
+        Parameters
+        ----------
+        ligand_coords:
+            Tensor containing ligand heavy atom coordinates shaped
+            ``(N, A, 3)`` for ``N`` poses.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            The first element is the score tensor returned by :meth:`scoring`
+            and the second element contains the gradient with respect to the
+            provided coordinates (matching the input shape).
+        """
+
+        if self.ligand is None:
+            raise ValueError("Ligand must be initialised before scoring.")
+
+        coords = ligand_coords.clone().detach().requires_grad_(True)
+
+        self.ligand.pose_heavy_atoms_coords = coords
+        self.number_of_poses = coords.size(0)
+
+        score = self.scoring()
+        total = score.sum()
+        total.backward()
+
+        gradient = coords.grad.clone()
+        self.ligand.pose_heavy_atoms_coords = coords.detach()
+
+        return score.detach(), gradient.detach().view_as(coords)
        
 
 
