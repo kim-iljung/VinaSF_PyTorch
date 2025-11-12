@@ -37,7 +37,7 @@ from vinasf_torch import VinaSFTorch
 receptor = Chem.MolFromPDBFile("receptor.pdb", removeHs=False)
 ligand = Chem.SDMolSupplier("ligand.sdf", removeHs=False)[0]
 
-vina = VinaSFTorch.from_rdkit(receptor, ligand).to("cuda")
+vina = VinaSFTorch.from_rdkit(receptor, ligand)
 
 # Use either the current ligand coordinates or supply your own tensor with
 # shape (N, A, 3) for N poses and A heavy atoms.
