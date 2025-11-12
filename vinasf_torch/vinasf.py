@@ -9,7 +9,7 @@ import time
 from .utils import ATOMTYPE_MAPPING, COVALENT_RADII_DICT, VDW_RADII_DICT
 
 
-class VinaSF:
+class VinaSFTorch(torch.nn.Module):
     """Vina scoring function. This is a pytorch implementation of the
     popular Vina score. This scoring function considers guassian terms,
     hydrogen bonds, and other terms.
@@ -32,6 +32,8 @@ class VinaSF:
         covalent_radii_dict: Optional[Dict[str, float]] = None,
         vdw_radii_dict: Optional[Dict[str, float]] = None,
     ) -> None:
+        super().__init__()
+
         self._initialize_entities(
             receptor,
             ligand,
@@ -142,8 +144,8 @@ class VinaSF:
         atomtype_mapping: Optional[Dict[str, Any]] = None,
         covalent_radii_dict: Optional[Dict[str, float]] = None,
         vdw_radii_dict: Optional[Dict[str, float]] = None,
-    ) -> "VinaSF":
-        """Construct a :class:`VinaSF` instance from RDKit molecules.
+    ) -> "VinaSFTorch":
+        """Construct a :class:`VinaSFTorch` instance from RDKit molecules.
 
         Parameters
         ----------
@@ -158,7 +160,7 @@ class VinaSF:
 
         Returns
         -------
-        VinaSF
+        VinaSFTorch
             Instance initialised with lightweight receptor/ligand adapters.
         """
 
