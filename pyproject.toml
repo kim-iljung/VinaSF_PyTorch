@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vinasf-pytorch"
+version = "0.1.0"
+description = "PyTorch implementation of the Vina scoring function and OpenDock tooling"
+readme = "README.md"
+authors = [
+    { name = "Kim Iljung" }
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+]
+
+[project.urls]
+Homepage = "https://github.com/kim--iljung/VinaSF_PyTorch"
+Source = "https://github.com/kim--iljung/VinaSF_PyTorch"
+Issues = "https://github.com/kim--iljung/VinaSF_PyTorch/issues"
+
+[tool.setuptools.packages.find]
+include = ["opendock*", "vinasf_torch*"]
