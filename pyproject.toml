@@ -24,9 +24,12 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kim--iljung/VinaSF_PyTorch"
-Source = "https://github.com/kim--iljung/VinaSF_PyTorch"
-Issues = "https://github.com/kim--iljung/VinaSF_PyTorch/issues"
+Homepage = "https://github.com/kim-iljung/VinaSF_PyTorch"
+Source = "https://github.com/kim-iljung/VinaSF_PyTorch"
+Issues = "https://github.com/kim-iljung/VinaSF_PyTorch/issues"
 
 [tool.setuptools.packages.find]
 include = ["vinasf_torch*"]
+
+[tool.setuptools.package-data]
+"vinasf_torch" = ["data/*.json"]
