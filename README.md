@@ -48,9 +48,6 @@ print("Score per pose:", score)
 print("Gradient tensor:", gradient)
 ```
 
-The package exposes both the `vinasf_torch` module (for direct scoring) and the `opendock`
-framework components (for building docking workflows).
-
 ## Contributing
 Contributions, bug reports, and feature requests are welcome! Please open an issue or submit a
 pull request so that improvements can be discussed.
