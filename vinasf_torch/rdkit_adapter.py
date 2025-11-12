@@ -52,7 +52,7 @@ def _require_rdkit() -> Any:
         from rdkit import Chem
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
-            "RDKit is required to construct VinaSF adapters from RDKit molecules"
+            "RDKit is required to construct VinaSFTorch adapters from RDKit molecules"
         ) from exc
     return Chem
 
