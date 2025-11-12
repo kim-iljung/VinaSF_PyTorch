@@ -10,7 +10,7 @@ OpenDock sampling framework. It is a fork of the excellent
 You can install the latest version directly from GitHub with `pip`:
 
 ```bash
-pip install "git+https://github.com/kim--iljung/VinaSF_PyTorch.git"
+pip install git+https://github.com/kim-iljung/VinaSF_PyTorch.git
 ```
 
 This command uses the `pyproject.toml` configuration in the repository so no additional
