@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -133,6 +133,102 @@ class VinaSFTorch(torch.nn.Module):
         self.dist: Optional[torch.Tensor] = None
         self.intra_dist: Optional[torch.Tensor] = None
 
+    # ---------------------------------------------------------------------
+    # ``torch.nn.Module`` overrides
+    # ------------------------------------------------------------------
+    def to(self, *args: Any, **kwargs: Any) -> "VinaSFTorch":  # type: ignore[override]
+        """Move the module and cached tensors to the requested device/dtype.
+
+        ``torch.nn.Module.to`` only moves parameters and buffers that are
+        registered on the module.  The receptor and ligand adapters stash
+        tensors on plain attributes, so we mirror the requested ``to``
+        operation on those cached tensors as well.
+        """
+
+        to_kwargs = self._parse_to_kwargs(*args, **kwargs)
+
+        module = super().to(*args, **kwargs)
+        module._move_cached_tensors(**to_kwargs)
+        return module
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_to_kwargs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        device: Optional[torch.device] = kwargs.get("device")
+        dtype: Optional[torch.dtype] = kwargs.get("dtype")
+        non_blocking: bool = kwargs.get("non_blocking", False)
+        copy: bool = kwargs.get("copy", False)
+        memory_format = kwargs.get("memory_format")
+
+        for arg in args:
+            if isinstance(arg, torch.device):
+                device = arg
+            elif isinstance(arg, str):
+                device = torch.device(arg)
+            elif isinstance(arg, torch.dtype):
+                dtype = arg
+            elif torch.is_tensor(arg):
+                device = arg.device
+                if dtype is None:
+                    dtype = arg.dtype
+
+        to_kwargs: Dict[str, Any] = {}
+        if device is not None:
+            to_kwargs["device"] = device
+        if dtype is not None:
+            to_kwargs["dtype"] = dtype
+        if non_blocking:
+            to_kwargs["non_blocking"] = non_blocking
+        if copy:
+            to_kwargs["copy"] = copy
+        if memory_format is not None:
+            to_kwargs["memory_format"] = memory_format
+
+        return to_kwargs
+
+    def _move_cached_tensors(self, **to_kwargs: Any) -> None:
+        if not to_kwargs:
+            return
+
+        device = to_kwargs.get("device")
+        if isinstance(device, str):  # Accept string device specifiers.
+            device = torch.device(device)
+            to_kwargs = dict(to_kwargs)
+            to_kwargs["device"] = device
+
+        def convert(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if tensor is None:
+                return None
+            return tensor.to(**to_kwargs)
+
+        # Cached tensors associated with the ligand entity.
+        if self.ligand is not None:
+            lig_coords = getattr(self.ligand, "pose_heavy_atoms_coords", None)
+            if isinstance(lig_coords, torch.Tensor):
+                converted = convert(lig_coords)
+                if converted is not None:
+                    self.ligand.pose_heavy_atoms_coords = converted
+                    self.pose_heavy_atoms_coords = converted
+
+        # Cached tensors associated with the receptor entity.
+        if self.receptor is not None:
+            rec_coords = getattr(self.receptor, "rec_heavy_atoms_xyz", None)
+            if isinstance(rec_coords, torch.Tensor):
+                converted = convert(rec_coords)
+                if converted is not None:
+                    self.receptor.rec_heavy_atoms_xyz = converted
+                    self.rec_heavy_atoms_xyz = converted
+
+        # Miscellaneous tensors stored as attributes on the module.
+        for attr in ("dist", "intra_dist", "intra_repulsive_term", "inter_repulsive_term", "FR_repulsive_term"):
+            tensor = getattr(self, attr, None)
+            if isinstance(tensor, torch.Tensor):
+                converted = convert(tensor)
+                if converted is not None:
+                    setattr(self, attr, converted)
+
     @classmethod
     def from_rdkit(
         cls,
@@ -191,11 +287,23 @@ class VinaSFTorch(torch.nn.Module):
                 "Both receptor and ligand must be provided to compute distances."
             )
 
-        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz.expand(
-            len(self.ligand.pose_heavy_atoms_coords), -1, -1
+        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz
+        ligand_coords = self.ligand.pose_heavy_atoms_coords
+
+        if isinstance(rec_heavy_atoms_xyz, torch.Tensor):
+            if rec_heavy_atoms_xyz.device != ligand_coords.device:
+                rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.to(ligand_coords.device)
+            if rec_heavy_atoms_xyz.dtype != ligand_coords.dtype:
+                rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.to(ligand_coords.dtype)
+            if rec_heavy_atoms_xyz is not self.rec_heavy_atoms_xyz:
+                self.rec_heavy_atoms_xyz = rec_heavy_atoms_xyz
+                if self.receptor is not None:
+                    self.receptor.rec_heavy_atoms_xyz = rec_heavy_atoms_xyz
+
+        rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.expand(
+            len(ligand_coords), -1, -1
         )
 
-        ligand_coords = self.ligand.pose_heavy_atoms_coords
         dist = -2 * torch.matmul(
             rec_heavy_atoms_xyz, ligand_coords.permute(0, 2, 1)
         )
@@ -907,6 +1015,7 @@ class VinaSFTorch(torch.nn.Module):
         coords = ligand_coords.clone().detach().requires_grad_(True)
 
         self.ligand.pose_heavy_atoms_coords = coords
+        self.pose_heavy_atoms_coords = coords
         self.number_of_poses = coords.size(0)
 
         score = self.scoring()
@@ -914,7 +1023,9 @@ class VinaSFTorch(torch.nn.Module):
         total.backward()
 
         gradient = coords.grad.clone()
-        self.ligand.pose_heavy_atoms_coords = coords.detach()
+        detached = coords.detach()
+        self.ligand.pose_heavy_atoms_coords = detached
+        self.pose_heavy_atoms_coords = detached
 
         return score.detach(), gradient.detach().view_as(coords)
        

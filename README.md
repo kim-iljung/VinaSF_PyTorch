@@ -48,6 +48,10 @@ print("Score per pose:", score)
 print("Gradient tensor:", gradient)
 ```
 
+Calling ``.to(device)`` on ``VinaSFTorch`` moves both the module and any cached
+receptor/ligand tensors to the requested device, so the entire score evaluation
+can run on GPU without manual tensor transfers.
+
 ## Contributing
 Contributions, bug reports, and feature requests are welcome! Please open an issue or submit a
 pull request so that improvements can be discussed.
