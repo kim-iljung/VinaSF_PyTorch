@@ -114,7 +114,7 @@ class VinaSF:
             self.rec_index_to_series_dict = getattr(
                 receptor, "rec_index_to_series_dict", {}
             )
-            self.num_of_rec_ha = len(self.rec_heavy_atoms_xyz)
+            self.num_of_rec_ha = self.rec_heavy_atoms_xyz.size(-2)
         else:
             self.receptor = None
             self.rec_heavy_atoms_xyz = None
@@ -189,11 +189,8 @@ class VinaSF:
                 "Both receptor and ligand must be provided to compute distances."
             )
 
-        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz
-        if rec_heavy_atoms_xyz.dim() == 2:
-            rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.unsqueeze(0)
-        rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.expand(
-            len(self.ligand.pose_heavy_atoms_coords), -1, 3
+        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz.expand(
+            len(self.ligand.pose_heavy_atoms_coords), -1, -1
         )
 
         ligand_coords = self.ligand.pose_heavy_atoms_coords
@@ -891,9 +888,8 @@ class VinaSF:
         Parameters
         ----------
         ligand_coords:
-            Tensor containing ligand heavy atom coordinates.  The tensor can be
-            shaped ``(N, A, 3)`` for ``N`` poses or ``(A, 3)`` for a single
-            pose.
+            Tensor containing ligand heavy atom coordinates shaped
+            ``(N, A, 3)`` for ``N`` poses.
 
         Returns
         -------
@@ -906,10 +902,7 @@ class VinaSF:
         if self.ligand is None:
             raise ValueError("Ligand must be initialised before scoring.")
 
-        coords = ligand_coords
-        if coords.dim() == 2:
-            coords = coords.unsqueeze(0)
-        coords = coords.clone().detach().requires_grad_(True)
+        coords = ligand_coords.clone().detach().requires_grad_(True)
 
         self.ligand.pose_heavy_atoms_coords = coords
         self.number_of_poses = coords.size(0)
@@ -921,12 +914,7 @@ class VinaSF:
         gradient = coords.grad.clone()
         self.ligand.pose_heavy_atoms_coords = coords.detach()
 
-        if ligand_coords.dim() == 2:
-            gradient = gradient.squeeze(0)
-        else:
-            gradient = gradient.view_as(coords)
-
-        return score.detach(), gradient.detach()
+        return score.detach(), gradient.detach().view_as(coords)
        
 
 

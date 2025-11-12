@@ -196,7 +196,7 @@ class RDKitReceptorAdapter:
         atomtype_mapping = atomtype_mapping or ATOMTYPE_MAPPING
 
         coords = _get_conformer_coords(mol, conformer_id, heavy_atom_indices)
-        xyz_tensor = torch.tensor(coords, dtype=torch.float32)
+        xyz_tensor = torch.tensor(coords, dtype=torch.float32).unsqueeze(0)
 
         xs_types: List[str] = []
         for atom in heavy_atoms:
