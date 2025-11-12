@@ -1,11 +1,15 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
 import numpy as np
 import torch
 import time
 
-from .base import BaseScoringFunction
+from .utils import ATOMTYPE_MAPPING, COVALENT_RADII_DICT, VDW_RADII_DICT
 
 
-class VinaSF(BaseScoringFunction):
+class VinaSF:
     """Vina scoring function. This is a pytorch implementation of the
     popular Vina score. This scoring function considers guassian terms,
     hydrogen bonds, and other terms.
@@ -19,12 +23,22 @@ class VinaSF(BaseScoringFunction):
     scoring: calculate the binding energy between the ligand and the receptor.
     """
 
-    def __init__(self,
-                 receptor=None,
-                 ligand=None,
-                 ):
-        # inheritant from base class
-        super(VinaSF, self).__init__(receptor=receptor, ligand=ligand)
+    def __init__(
+        self,
+        receptor: Optional[Any] = None,
+        ligand: Optional[Any] = None,
+        *,
+        atomtype_mapping: Optional[Dict[str, Any]] = None,
+        covalent_radii_dict: Optional[Dict[str, float]] = None,
+        vdw_radii_dict: Optional[Dict[str, float]] = None,
+    ) -> None:
+        self._initialize_entities(
+            receptor,
+            ligand,
+            atomtype_mapping=atomtype_mapping,
+            covalent_radii_dict=covalent_radii_dict,
+            vdw_radii_dict=vdw_radii_dict,
+        )
 
         # variable of the protein-ligand interaction
         self.dist = torch.tensor([])
@@ -39,13 +53,127 @@ class VinaSF(BaseScoringFunction):
                                                      + self.lig_frame_heavy_atoms_index_list
         self.number_of_all_frames = len(self.all_root_frame_heavy_atoms_index_list)
 
-        self.lig_intra_interacting_pairs = self.ligand.intra_interacting_pairs
+        self.lig_intra_interacting_pairs = (
+            self.ligand.intra_interacting_pairs if self.ligand is not None else []
+        )
         # self.intra_lig_is_hydro = []
         # self.intra_lig_is_hb = []
         # self.intra_vdw_distance = []
         #self.prepare_intra_information()
         # self.flag=0
         #
+
+    def _initialize_entities(
+        self,
+        receptor: Optional[Any],
+        ligand: Optional[Any],
+        *,
+        atomtype_mapping: Optional[Dict[str, Any]],
+        covalent_radii_dict: Optional[Dict[str, float]],
+        vdw_radii_dict: Optional[Dict[str, float]],
+    ) -> None:
+        if ligand is not None:
+            self.ligand = ligand
+            self.pose_heavy_atoms_coords = ligand.pose_heavy_atoms_coords
+            self.lig_heavy_atoms_element = getattr(ligand, "lig_heavy_atoms_element", None)
+            self.updated_lig_heavy_atoms_xs_types = getattr(
+                ligand, "updated_lig_heavy_atoms_xs_types", []
+            )
+            self.lig_root_atom_index = getattr(ligand, "root_heavy_atom_index", None)
+            self.lig_frame_heavy_atoms_index_list = getattr(
+                ligand, "frame_heavy_atoms_index_list", []
+            )
+            self.lig_torsion_bond_index = getattr(ligand, "torsion_bond_index", [])
+            self.lig_intra_interacting_pairs = getattr(ligand, "intra_interacting_pairs", [])
+            self.num_of_lig_ha = getattr(ligand, "number_of_heavy_atoms", None)
+            self.number_of_poses = len(ligand.pose_heavy_atoms_coords)
+        else:
+            self.ligand = None
+            self.pose_heavy_atoms_coords = None
+            self.lig_heavy_atoms_element = None
+            self.updated_lig_heavy_atoms_xs_types = []
+            self.lig_root_atom_index = None
+            self.lig_frame_heavy_atoms_index_list = []
+            self.lig_torsion_bond_index = []
+            self.lig_intra_interacting_pairs = []
+            self.num_of_lig_ha = None
+            self.number_of_poses = 0
+
+        if receptor is not None:
+            self.receptor = receptor
+            self.rec_heavy_atoms_xyz = receptor.rec_heavy_atoms_xyz
+            self.rec_heavy_atoms_xs_types = getattr(
+                receptor, "rec_heavy_atoms_xs_types", []
+            )
+            self.residues_heavy_atoms_pairs = getattr(
+                receptor, "residues_heavy_atoms_pairs", []
+            )
+            self.heavy_atoms_residues_indices = getattr(
+                receptor, "heavy_atoms_residues_indices", []
+            )
+            self.rec_index_to_series_dict = getattr(
+                receptor, "rec_index_to_series_dict", {}
+            )
+            self.num_of_rec_ha = len(self.rec_heavy_atoms_xyz)
+        else:
+            self.receptor = None
+            self.rec_heavy_atoms_xyz = None
+            self.rec_heavy_atoms_xs_types = []
+            self.residues_heavy_atoms_pairs = []
+            self.heavy_atoms_residues_indices = []
+            self.rec_index_to_series_dict = {}
+            self.num_of_rec_ha = 0
+
+        self.atomtype_mapping = atomtype_mapping or ATOMTYPE_MAPPING
+        self.covalent_radii_dict = covalent_radii_dict or COVALENT_RADII_DICT
+        self.vdw_radii_dict = vdw_radii_dict or VDW_RADII_DICT
+
+        self.dist: Optional[torch.Tensor] = None
+        self.intra_dist: Optional[torch.Tensor] = None
+
+    def generate_pldist_mtrx(self) -> torch.Tensor:
+        if self.receptor is None or self.ligand is None:
+            raise ValueError(
+                "Both receptor and ligand must be provided to compute distances."
+            )
+
+        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz
+        if rec_heavy_atoms_xyz.dim() == 2:
+            rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.unsqueeze(0)
+        rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.expand(
+            len(self.ligand.pose_heavy_atoms_coords), -1, 3
+        )
+
+        ligand_coords = self.ligand.pose_heavy_atoms_coords
+        dist = -2 * torch.matmul(
+            rec_heavy_atoms_xyz, ligand_coords.permute(0, 2, 1)
+        )
+        dist += torch.sum(rec_heavy_atoms_xyz ** 2, -1).view(-1, rec_heavy_atoms_xyz.size(1), 1)
+        dist += torch.sum(ligand_coords ** 2, -1).view(-1, 1, ligand_coords.size(1))
+        dist = (dist >= 0) * dist
+        self.dist = torch.sqrt(dist)
+
+        return self.dist
+
+    def generate_intra_mtrx(self) -> torch.Tensor:
+        if self.ligand is None:
+            raise ValueError("Ligand must be provided to compute intra distances.")
+
+        ligand_coords = self.ligand.pose_heavy_atoms_coords
+        num_poses = ligand_coords.size(0)
+        if not self.lig_intra_interacting_pairs:
+            self.intra_dist = ligand_coords.new_zeros((num_poses, 0))
+            return self.intra_dist
+
+        pair_indices = torch.tensor(
+            self.lig_intra_interacting_pairs,
+            dtype=torch.long,
+            device=ligand_coords.device,
+        )
+        atom_i = ligand_coords.index_select(1, pair_indices[:, 0])
+        atom_j = ligand_coords.index_select(1, pair_indices[:, 1])
+        self.intra_dist = torch.sqrt(torch.sum(torch.square(atom_i - atom_j), dim=-1))
+        return self.intra_dist
 
     def cal_inter_repulsion(self, dist, vdw_sum):
         """
