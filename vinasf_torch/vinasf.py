@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import time
 
-from ..core import ATOMTYPE_MAPPING, COVALENT_RADII_DICT, VDW_RADII_DICT
+from .utils import ATOMTYPE_MAPPING, COVALENT_RADII_DICT, VDW_RADII_DICT
 
 
 class VinaSF:
