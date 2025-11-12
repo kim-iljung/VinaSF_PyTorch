@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vinasf-pytorch"
+name = "vinasf-torch"
 version = "0.1.0"
 description = "PyTorch implementation of the Vina scoring function and OpenDock tooling"
 readme = "README.md"
@@ -29,4 +29,4 @@ Source = "https://github.com/kim--iljung/VinaSF_PyTorch"
 Issues = "https://github.com/kim--iljung/VinaSF_PyTorch/issues"
 
 [tool.setuptools.packages.find]
-include = ["opendock*", "vinasf_torch*"]
+include = ["vinasf_torch*"]
