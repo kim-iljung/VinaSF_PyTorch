@@ -593,10 +593,16 @@ class VinaSFTorch(torch.nn.Module):
         _Max_dim = 0
         for each_dist in self.dist:
             each_rec_atom_indices, each_lig_atom_indices = torch.where(each_dist <= 8)
-            rec_atom_indices_list.append(each_rec_atom_indices.numpy().tolist())
-            lig_atom_indices_list.append(each_lig_atom_indices.numpy().tolist())
-            all_selected_rec_atom_indices += each_rec_atom_indices.numpy().tolist()
-            all_selected_lig_atom_indices += each_lig_atom_indices.numpy().tolist()
+            rec_indices_cpu = each_rec_atom_indices.detach().cpu()
+            lig_indices_cpu = each_lig_atom_indices.detach().cpu()
+
+            rec_indices_list = rec_indices_cpu.tolist()
+            lig_indices_list = lig_indices_cpu.tolist()
+
+            rec_atom_indices_list.append(rec_indices_list)
+            lig_atom_indices_list.append(lig_indices_list)
+            all_selected_rec_atom_indices += rec_indices_list
+            all_selected_lig_atom_indices += lig_indices_list
 
             if len(each_rec_atom_indices) > _Max_dim:
                 _Max_dim = len(each_rec_atom_indices)
