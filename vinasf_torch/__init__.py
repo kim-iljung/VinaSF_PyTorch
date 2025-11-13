@@ -5,7 +5,7 @@ from .rdkit_adapter import (
     RDKitReceptorAdapter,
     RDKitReceptorAdapterFactory,
 )
-from .vinasf import VinaSFTorch, VinaScoreCore
+from .model import VinaSFTorch, VinaScoreCore
 
 __all__ = [
     "VinaSFTorch",
