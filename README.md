@@ -1,7 +1,6 @@
 # VinaSF PyTorch
 
-This repository provides a PyTorch-friendly version of the Vina scoring function and the
-OpenDock sampling framework. It is a fork of the excellent
+This repository provides a PyTorch-friendly version of the Vina scoring function. It is a fork of the excellent
 [guyuehuo/opendock](https://github.com/guyuehuo/opendock) project.
 
 ## Installation
