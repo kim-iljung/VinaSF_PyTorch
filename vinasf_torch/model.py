@@ -1,27 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
-
-import numpy as np
-import torch
+import math
 import time
+from typing import Any, Dict, Optional, Tuple
+
+import torch
 
 from .utils import ATOMTYPE_MAPPING, COVALENT_RADII_DICT, VDW_RADII_DICT
 
 
-class VinaSFTorch(torch.nn.Module):
-    """Vina scoring function. This is a pytorch implementation of the
-    popular Vina score. This scoring function considers guassian terms,
-    hydrogen bonds, and other terms.
+def _like_of(*tensors: Optional[torch.Tensor]) -> torch.Tensor:
+    """첫 번째로 발견한 텐서를 기준으로 device/dtype 컨텍스트를 반환.
+    모두 None이면 CPU float32 스칼라 텐서를 돌려준다."""
+    for t in tensors:
+        if isinstance(t, torch.Tensor):
+            return t
+    return torch.zeros((), dtype=torch.float32)
 
-    Methods
-    -------
-    cal_inter_repulsive: calculate the inter-molecular repulsive energy \
-        between the ligand and the receptor.
-    cal_intra_repulsive: calculate the intra-molecular repulsive energy \
-        of the ligand itself.
-    scoring: calculate the binding energy between the ligand and the receptor.
-    """
+
+class VinaSFTorch(torch.nn.Module):
+    """AutoDock Vina 점수의 PyTorch 구현(가우시안/반발/소수성/H-결합 항 포함)."""
 
     def __init__(
         self,
@@ -42,29 +40,39 @@ class VinaSFTorch(torch.nn.Module):
             vdw_radii_dict=vdw_radii_dict,
         )
 
-        # variable of the protein-ligand interaction
-        self.dist = torch.tensor([])
-        self.intra_repulsive_term = torch.tensor(1e-6)
-        self.inter_repulsive_term = torch.tensor(1e-6)
-        self.FR_repulsive_term = torch.tensor(1e-6)
+        # 자주 쓰는 버퍼를 등록(자동 이동용). 초기엔 빈 텐서.
+        self.register_buffer("dist", torch.empty(0))
+        self.register_buffer("intra_dist", torch.empty(0))
+        self.register_buffer("intra_repulsive_term", torch.tensor(1e-6))
+        self.register_buffer("inter_repulsive_term", torch.tensor(1e-6))
+        self.register_buffer("FR_repulsive_term", torch.tensor(1e-6))
+
         self.repulsive_ = 6
+        self.vina_inter_energy: torch.Tensor = torch.tensor(0.0)
 
-        self.vina_inter_energy = 0.0
-
-        self.all_root_frame_heavy_atoms_index_list = [self.lig_root_atom_index] \
-                                                     + self.lig_frame_heavy_atoms_index_list
+        self.all_root_frame_heavy_atoms_index_list = (
+            [self.lig_root_atom_index] + self.lig_frame_heavy_atoms_index_list
+            if self.lig_root_atom_index is not None
+            else self.lig_frame_heavy_atoms_index_list
+        )
         self.number_of_all_frames = len(self.all_root_frame_heavy_atoms_index_list)
 
         self.lig_intra_interacting_pairs = (
             self.ligand.intra_interacting_pairs if self.ligand is not None else []
         )
-        # self.intra_lig_is_hydro = []
-        # self.intra_lig_is_hb = []
-        # self.intra_vdw_distance = []
-        #self.prepare_intra_information()
-        # self.flag=0
-        #
 
+        # 준비 과정에서 만들어지는 텐서들(동적으로 계산됨)
+        self.rec_lig_is_hydrophobic: Optional[torch.Tensor] = None
+        self.rec_lig_is_hbond: Optional[torch.Tensor] = None
+        self.rec_lig_atom_vdw_sum: Optional[torch.Tensor] = None
+        self.vina_dist: Optional[torch.Tensor] = None
+
+        self.intra_rec_lig_is_hydrophobic: Optional[torch.Tensor] = None
+        self.intra_rec_lig_is_hbond: Optional[torch.Tensor] = None
+        self.intra_rec_lig_atom_vdw_sum: Optional[torch.Tensor] = None
+        self.intra_vina_dist: Optional[torch.Tensor] = None
+
+    # -------------------------- 초기화 --------------------------
     def _initialize_entities(
         self,
         receptor: Optional[Any],
@@ -78,13 +86,9 @@ class VinaSFTorch(torch.nn.Module):
             self.ligand = ligand
             self.pose_heavy_atoms_coords = ligand.pose_heavy_atoms_coords
             self.lig_heavy_atoms_element = getattr(ligand, "lig_heavy_atoms_element", None)
-            self.updated_lig_heavy_atoms_xs_types = getattr(
-                ligand, "updated_lig_heavy_atoms_xs_types", []
-            )
+            self.updated_lig_heavy_atoms_xs_types = getattr(ligand, "updated_lig_heavy_atoms_xs_types", [])
             self.lig_root_atom_index = getattr(ligand, "root_heavy_atom_index", None)
-            self.lig_frame_heavy_atoms_index_list = getattr(
-                ligand, "frame_heavy_atoms_index_list", []
-            )
+            self.lig_frame_heavy_atoms_index_list = getattr(ligand, "frame_heavy_atoms_index_list", [])
             self.lig_torsion_bond_index = getattr(ligand, "torsion_bond_index", [])
             self.lig_intra_interacting_pairs = getattr(ligand, "intra_interacting_pairs", [])
             self.num_of_lig_ha = getattr(ligand, "number_of_heavy_atoms", None)
@@ -104,18 +108,10 @@ class VinaSFTorch(torch.nn.Module):
         if receptor is not None:
             self.receptor = receptor
             self.rec_heavy_atoms_xyz = receptor.rec_heavy_atoms_xyz
-            self.rec_heavy_atoms_xs_types = getattr(
-                receptor, "rec_heavy_atoms_xs_types", []
-            )
-            self.residues_heavy_atoms_pairs = getattr(
-                receptor, "residues_heavy_atoms_pairs", []
-            )
-            self.heavy_atoms_residues_indices = getattr(
-                receptor, "heavy_atoms_residues_indices", []
-            )
-            self.rec_index_to_series_dict = getattr(
-                receptor, "rec_index_to_series_dict", {}
-            )
+            self.rec_heavy_atoms_xs_types = getattr(receptor, "rec_heavy_atoms_xs_types", [])
+            self.residues_heavy_atoms_pairs = getattr(receptor, "residues_heavy_atoms_pairs", [])
+            self.heavy_atoms_residues_indices = getattr(receptor, "heavy_atoms_residues_indices", [])
+            self.rec_index_to_series_dict = getattr(receptor, "rec_index_to_series_dict", {})
             self.num_of_rec_ha = self.rec_heavy_atoms_xyz.size(-2)
         else:
             self.receptor = None
@@ -130,30 +126,14 @@ class VinaSFTorch(torch.nn.Module):
         self.covalent_radii_dict = covalent_radii_dict or COVALENT_RADII_DICT
         self.vdw_radii_dict = vdw_radii_dict or VDW_RADII_DICT
 
-        self.dist: Optional[torch.Tensor] = None
-        self.intra_dist: Optional[torch.Tensor] = None
-
-    # ---------------------------------------------------------------------
-    # ``torch.nn.Module`` overrides
-    # ------------------------------------------------------------------
+    # -------------------------- torch.nn.Module override --------------------------
     def to(self, *args: Any, **kwargs: Any) -> "VinaSFTorch":  # type: ignore[override]
-        """Move the module and cached tensors to the requested device/dtype.
-
-        ``torch.nn.Module.to`` only moves parameters and buffers that are
-        registered on the module.  The receptor and ligand adapters stash
-        tensors on plain attributes, so we mirror the requested ``to``
-        operation on those cached tensors as well.
-        """
-
+        """모듈과 캐시된 텐서들을 요청된 device/dtype로 이동."""
         to_kwargs = self._parse_to_kwargs(*args, **kwargs)
-
         module = super().to(*args, **kwargs)
         module._move_cached_tensors(**to_kwargs)
         return module
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _parse_to_kwargs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         device: Optional[torch.device] = kwargs.get("device")
@@ -193,7 +173,7 @@ class VinaSFTorch(torch.nn.Module):
             return
 
         device = to_kwargs.get("device")
-        if isinstance(device, str):  # Accept string device specifiers.
+        if isinstance(device, str):
             device = torch.device(device)
             to_kwargs = dict(to_kwargs)
             to_kwargs["device"] = device
@@ -203,7 +183,7 @@ class VinaSFTorch(torch.nn.Module):
                 return None
             return tensor.to(**to_kwargs)
 
-        # Cached tensors associated with the ligand entity.
+        # 리간드 좌표
         if self.ligand is not None:
             lig_coords = getattr(self.ligand, "pose_heavy_atoms_coords", None)
             if isinstance(lig_coords, torch.Tensor):
@@ -212,7 +192,7 @@ class VinaSFTorch(torch.nn.Module):
                     self.ligand.pose_heavy_atoms_coords = converted
                     self.pose_heavy_atoms_coords = converted
 
-        # Cached tensors associated with the receptor entity.
+        # 수용체 좌표
         if self.receptor is not None:
             rec_coords = getattr(self.receptor, "rec_heavy_atoms_xyz", None)
             if isinstance(rec_coords, torch.Tensor):
@@ -221,14 +201,30 @@ class VinaSFTorch(torch.nn.Module):
                     self.receptor.rec_heavy_atoms_xyz = converted
                     self.rec_heavy_atoms_xyz = converted
 
-        # Miscellaneous tensors stored as attributes on the module.
-        for attr in ("dist", "intra_dist", "intra_repulsive_term", "inter_repulsive_term", "FR_repulsive_term"):
+        # 모듈 속성으로 저장된 텐서들
+        for attr in (
+            "dist",
+            "intra_dist",
+            "intra_repulsive_term",
+            "inter_repulsive_term",
+            "FR_repulsive_term",
+            "vina_inter_energy",
+            "rec_lig_is_hydrophobic",
+            "rec_lig_is_hbond",
+            "rec_lig_atom_vdw_sum",
+            "vina_dist",
+            "intra_rec_lig_is_hydrophobic",
+            "intra_rec_lig_is_hbond",
+            "intra_rec_lig_atom_vdw_sum",
+            "intra_vina_dist",
+        ):
             tensor = getattr(self, attr, None)
             if isinstance(tensor, torch.Tensor):
                 converted = convert(tensor)
                 if converted is not None:
                     setattr(self, attr, converted)
 
+    # -------------------------- RDKit 어댑터 --------------------------
     @classmethod
     def from_rdkit(
         cls,
@@ -241,25 +237,6 @@ class VinaSFTorch(torch.nn.Module):
         covalent_radii_dict: Optional[Dict[str, float]] = None,
         vdw_radii_dict: Optional[Dict[str, float]] = None,
     ) -> "VinaSFTorch":
-        """Construct a :class:`VinaSFTorch` instance from RDKit molecules.
-
-        Parameters
-        ----------
-        receptor_mol:
-            RDKit ``Chem.Mol`` instance representing the receptor.
-        ligand_mol:
-            RDKit ``Chem.Mol`` instance representing the ligand.
-        receptor_conformer_id:
-            Identifier of the conformer to extract receptor coordinates from.
-        ligand_conformer_id:
-            Identifier of the conformer to extract ligand coordinates from.
-
-        Returns
-        -------
-        VinaSFTorch
-            Instance initialised with lightweight receptor/ligand adapters.
-        """
-
         from .rdkit_adapter import RDKitLigandAdapter, RDKitReceptorAdapter
 
         receptor = RDKitReceptorAdapter.from_mol(
@@ -281,35 +258,26 @@ class VinaSFTorch(torch.nn.Module):
             vdw_radii_dict=vdw_radii_dict,
         )
 
+    # -------------------------- 거리 행렬 생성 --------------------------
     def generate_pldist_mtrx(self) -> torch.Tensor:
         if self.receptor is None or self.ligand is None:
-            raise ValueError(
-                "Both receptor and ligand must be provided to compute distances."
-            )
+            raise ValueError("Both receptor and ligand must be provided to compute distances.")
 
-        rec_heavy_atoms_xyz = self.rec_heavy_atoms_xyz
-        ligand_coords = self.ligand.pose_heavy_atoms_coords
+        rec = self.rec_heavy_atoms_xyz
+        lig = self.ligand.pose_heavy_atoms_coords
 
-        if isinstance(rec_heavy_atoms_xyz, torch.Tensor):
-            if rec_heavy_atoms_xyz.device != ligand_coords.device:
-                rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.to(ligand_coords.device)
-            if rec_heavy_atoms_xyz.dtype != ligand_coords.dtype:
-                rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.to(ligand_coords.dtype)
-            if rec_heavy_atoms_xyz is not self.rec_heavy_atoms_xyz:
-                self.rec_heavy_atoms_xyz = rec_heavy_atoms_xyz
-                if self.receptor is not None:
-                    self.receptor.rec_heavy_atoms_xyz = rec_heavy_atoms_xyz
+        if isinstance(rec, torch.Tensor):
+            if rec.device != lig.device or rec.dtype != lig.dtype:
+                rec = rec.to(device=lig.device, dtype=lig.dtype)
+                self.receptor.rec_heavy_atoms_xyz = rec
+                self.rec_heavy_atoms_xyz = rec
 
-        rec_heavy_atoms_xyz = rec_heavy_atoms_xyz.expand(
-            len(ligand_coords), -1, -1
-        )
+        rec = rec.expand(len(lig), -1, -1)  # (Nposes, Nrec, 3)
 
-        dist = -2 * torch.matmul(
-            rec_heavy_atoms_xyz, ligand_coords.permute(0, 2, 1)
-        )
-        dist += torch.sum(rec_heavy_atoms_xyz ** 2, -1).view(-1, rec_heavy_atoms_xyz.size(1), 1)
-        dist += torch.sum(ligand_coords ** 2, -1).view(-1, 1, ligand_coords.size(1))
-        dist = (dist >= 0) * dist
+        dist = -2 * torch.matmul(rec, lig.permute(0, 2, 1))
+        dist += torch.sum(rec ** 2, -1).unsqueeze(-1)
+        dist += torch.sum(lig ** 2, -1).unsqueeze(1)
+        dist = torch.clamp_min(dist, 0)
         self.dist = torch.sqrt(dist)
 
         return self.dist
@@ -318,626 +286,221 @@ class VinaSFTorch(torch.nn.Module):
         if self.ligand is None:
             raise ValueError("Ligand must be provided to compute intra distances.")
 
-        ligand_coords = self.ligand.pose_heavy_atoms_coords
-        num_poses = ligand_coords.size(0)
+        lig = self.ligand.pose_heavy_atoms_coords  # (Nposes, Alig, 3)
+        num_poses = lig.size(0)
+
         if not self.lig_intra_interacting_pairs:
-            self.intra_dist = ligand_coords.new_zeros((num_poses, 0))
+            self.intra_dist = lig.new_zeros((num_poses, 0))
             return self.intra_dist
 
-        pair_indices = torch.tensor(
-            self.lig_intra_interacting_pairs,
-            dtype=torch.long,
-            device=ligand_coords.device,
-        )
-        atom_i = ligand_coords.index_select(1, pair_indices[:, 0])
-        atom_j = ligand_coords.index_select(1, pair_indices[:, 1])
-        self.intra_dist = torch.sqrt(torch.sum(torch.square(atom_i - atom_j), dim=-1))
+        pair_indices = torch.as_tensor(
+            self.lig_intra_interacting_pairs, dtype=torch.long, device=lig.device
+        )  # (K, 2)
+        atom_i = lig.index_select(1, pair_indices[:, 0])
+        atom_j = lig.index_select(1, pair_indices[:, 1])
+        self.intra_dist = torch.sqrt(torch.sum((atom_i - atom_j) ** 2, dim=-1))
         return self.intra_dist
 
-    def cal_inter_repulsion(self, dist, vdw_sum):
-        """
-        When the distance between two atoms from the
-        protein-ligand complex is less than the sum of
-        the van der Waals radii,
-        an intermolecular repulsion term is generated.
-        """
-        _cond = (dist < vdw_sum) * 1.
-        _cond_sum = torch.sum(_cond, axis=1)
-        _zero_indices = torch.where(_cond_sum == 0)[0]
-        for index in _zero_indices:
-            index = int(index)
-            _cond[index][0] = torch.pow(dist[index][0], 20)
-
-        self.inter_repulsive_term = torch.sum(torch.pow(_cond * dist + \
-                                                        (_cond * dist == 0) * 1., -1 * self.repulsive_), axis=1) - \
-                                    torch.sum((_cond * dist) * 1., axis=1)
-
-        self.inter_repulsive_term = self.inter_repulsive_term.reshape(-1, 1)
-
-        return self.inter_repulsive_term
-
-    def cal_intra_repulsion_old(self):
-        """
-        When the distance between two atoms in adjacent frames in a molecule
-        are less than the sum of the van der Waals radii
-        of the two atoms, an intramolecular repulsion term is generated.
-        """
-
-        dist_list = []
-        vdw_list = []
-        # print("self.all_root_frame_heavy_atoms_index_list",self.all_root_frame_heavy_atoms_index_list)
-        # print("self.lig_torsion_bond_index",self.lig_torsion_bond_index)
-        for frame_i in range(0, self.number_of_all_frames - 1):
-            for frame_j in range(frame_i + 1, self.number_of_all_frames):
-
-                for i in self.all_root_frame_heavy_atoms_index_list[frame_i]:
-                    for j in self.all_root_frame_heavy_atoms_index_list[frame_j]:
-
-                        if [i, j] in self.lig_torsion_bond_index or [j, i] in self.lig_torsion_bond_index:
-                            # print("i j", i, j)
-                            continue
-
-                        # angstrom
-                        d = torch.sqrt(
-                            torch.sum(
-                                torch.square(self.ligand.pose_heavy_atoms_coords[:, i] - \
-                                             self.ligand.pose_heavy_atoms_coords[:, j]),
-                                axis=1))
-                        dist_list.append(d.reshape(-1, 1))
-
-                        i_xs = self.updated_lig_heavy_atoms_xs_types[i]
-                        j_xs = self.updated_lig_heavy_atoms_xs_types[j]
-
-                        # angstrom
-                        vdw_distance = self.vdw_radii_dict[i_xs] + self.vdw_radii_dict[j_xs]
-                        vdw_list.append(torch.tensor([vdw_distance]))
-                        #print("dist_list",dist_list)
-        #print("dist_list", dist_list)
-        dist_tensor = torch.cat(dist_list, axis=1)
-        vdw_tensor = torch.cat(vdw_list, axis=0)
-
-        self.intra_repulsive_term = torch.sum(torch.pow((dist_tensor < vdw_tensor) * 1. * dist_tensor + \
-                                                        (dist_tensor >= vdw_tensor) * 1., -1 * self.repulsive_),
-                                              axis=1) - \
-                                    torch.sum((dist_tensor >= vdw_tensor) * 1., axis=1)
-
-        self.intra_repulsive_term = self.intra_repulsive_term.reshape(-1, 1)
-
-        return self.intra_repulsive_term
-
-    def cal_intra_repulsion(self):
-        num_interacting_pairs = len(self.lig_intra_interacting_pairs)
-        intra_repulsive_term= torch.zeros(1)  # intra energy
-
-        for pair in self.lig_intra_interacting_pairs:
-            #print("pair",pair)
-            e=self.intra_score(pair)
-            #print("e",e)
-            intra_repulsive_term+=e
-        #print("intra_repulsive_term",intra_repulsive_term)
-        return intra_repulsive_term
-
-
-    def intra_score(self,pair):
-
-        dist_list = []
-        vdw_list = []
-        [i, j] = pair
-        # print("self.all_root_frame_heavy_atoms_index_list",self.all_root_frame_heavy_atoms_index_list)
-        # print("self.lig_torsion_bond_index",self.lig_torsion_bond_index)
-        d = torch.sqrt(
-            torch.sum(
-                torch.square(self.ligand.pose_heavy_atoms_coords[:, i] - \
-                             self.ligand.pose_heavy_atoms_coords[:, j]),
-                axis=1))
-        if d>8.0:
-            return torch.tensor([0.0])
-        dist_tensor=d.reshape(-1, 1)
-
-        i_xs = self.updated_lig_heavy_atoms_xs_types[i]
-        j_xs = self.updated_lig_heavy_atoms_xs_types[j]
-
-        # angstrom
-        vdw_distance = self.vdw_radii_dict[i_xs] + self.vdw_radii_dict[j_xs]
-        # vdw_list.append(torch.tensor([vdw_distance]))
-        vdw_tensor=torch.tensor([vdw_distance])
-        #print("dist_list",dist_tensor)
-        #print("vdw_list",vdw_tensor)
-
-
-
-        d_ij = dist_tensor - vdw_tensor
-        #print("d_ij",d_ij)
-       
-        Gauss_1 = torch.sum(torch.exp(- torch.pow(d_ij / 0.5, 2)), axis=1) - torch.sum((d_ij == 0) * 1., axis=1)
-        Gauss_2 = torch.sum(torch.exp(- torch.pow((d_ij - 3) / 2, 2)), axis=1) - \
-                  torch.sum((d_ij == 0) * 1. * torch.exp(torch.tensor(-1 * 9 / 4)), axis=1)
-
-        # Repulsion
-        Repulsion = torch.sum(torch.pow(((d_ij < 0) * d_ij), 2), axis=1)
-        # print("Repulsion:", Repulsion)
-
-        intra_lig_is_hydro=self.is_hydrophobic(i,True) * self.is_hydrophobic(j,True)
-        #print("intra_lig_is_hydro",intra_lig_is_hydro)
-        # Hydrophobic
-        Hydro_1 = intra_lig_is_hydro * (d_ij <= 0.5) * 1.
-
-        Hydro_2_condition = intra_lig_is_hydro * (d_ij > 0.5) * (d_ij < 1.5) * 1.
-        Hydro_2 = 1.5 * Hydro_2_condition - Hydro_2_condition * d_ij
-
-        Hydrophobic = torch.sum(Hydro_1 + Hydro_2, axis=1)
-        # print("Hydro:", Hydrophobic)
-
-        # HBonding
-
-        intra_lig_is_hb=self.intra_is_hbond(i,j)
-        #print("intra_lig_is_hb",intra_lig_is_hb)
-
-        hbond_1 = intra_lig_is_hb * (d_ij <= -0.7) * 1.
-        hbond_2 = intra_lig_is_hb * (d_ij < 0) * (d_ij > -0.7) * 1.0 * (- d_ij) / 0.7
-        HBonding = torch.sum(hbond_1 + hbond_2, axis=1)
-        # print("HB:", HBonding)
-
-        intra_energy = - 0.035579 * Gauss_1 - \
-                       0.005156 * Gauss_2 + 0.840245 * Repulsion - 0.035069 * Hydrophobic - 0.587439 * HBonding
-        # print("cost time in calculate energy:", time.time() - t)
-        return intra_energy
-
-
-    def get_vdw_radii(self, xs):
-        return self.vdw_radii_dict[xs]
-
-    def get_vina_dist(self, r_index, l_index):
-        return self.dist[:, r_index, l_index]
-
-    def get_vina_rec_xs(self, index):
-        return self.rec_heavy_atoms_xs_types[index]
-
-    def get_vina_lig_xs(self, index):
-        return self.updated_lig_heavy_atoms_xs_types[index]
-
-    def is_hydrophobic(self, index, is_lig):
-
-        if is_lig == True:
-            atom_xs = self.updated_lig_heavy_atoms_xs_types[index]
-        else:
-            atom_xs = self.rec_heavy_atoms_xs_types[index]
-
-        return atom_xs in ["C_H", "F_H", "Cl_H", "Br_H", "I_H"]
-
-    def is_hbdonor(self, index, is_lig):
-
-        if is_lig == True:
-            atom_xs = self.updated_lig_heavy_atoms_xs_types[index]
-        else:
-            atom_xs = self.rec_heavy_atoms_xs_types[index]
-
-        return atom_xs in ["N_D", "N_DA", "O_DA", "Met_D"]
-
-    def is_hbacceptor(self, index, is_lig):
-
-        if is_lig == True:
-            atom_xs = self.updated_lig_heavy_atoms_xs_types[index]
-        else:
-            atom_xs = self.rec_heavy_atoms_xs_types[index]
-
-        return atom_xs in ["N_A", "N_DA", "O_A", "O_DA"]
-
-    def is_hbond(self, atom_1, atom_2):
-        return (
-                (self.is_hbdonor(atom_1) and self.is_hbacceptor(atom_2)) or
-                (self.is_hbdonor(atom_2) and self.is_hbacceptor(atom_1))
-        )
-
-    def intra_is_hbond(self, atom_1, atom_2):
-        return (
-                (self.is_hbdonor(atom_1,True) and self.is_hbacceptor(atom_2,True)) or
-                (self.is_hbdonor(atom_2,True) and self.is_hbacceptor(atom_1,True))
-        )
-
-    def _pad(self, vector, _Max_dim):
-        #_vec = torch.zeros(_Max_dim - len(vector))
-        if _Max_dim - len(vector) >= 0:
-            _vec = torch.zeros(_Max_dim - len(vector))
-        else:
-            print("Error: Negative dimension encountered.")
-            #exit()
-            _vec = torch.zeros(0)
+    # -------------------------- 보조 기능 --------------------------
+    @staticmethod
+    def _pad(vector: torch.Tensor, max_len: int) -> torch.Tensor:
+        """벡터 뒤에 0을 붙여 길이를 max_len으로 맞춤."""
+        pad = max_len - vector.numel()
+        if pad <= 0:
             return vector
+        return torch.cat([vector, vector.new_zeros(pad)], dim=0)
 
-        #     #_vec = torch.zeros(_Max_dim - len(vector))
-        # #print("success")
-        # #print("_Max_dim", _Max_dim)
-        # #print("len(vector)", len(vector))
-        # #_vec = torch.zeros(_Max_dim - len(vector))
-        # new_vector = torch.cat((vector, _vec), axis=0)
+    # -------------------------- 데이터 준비(상호작용) --------------------------
+    def _prepare_data(self) -> "VinaSFTorch":
+        device_dtype_ref = _like_of(self.dist, self.pose_heavy_atoms_coords, self.rec_heavy_atoms_xyz)
 
-        #_vec = torch.zeros(_Max_dim - len(vector))
-        new_vector = torch.cat((vector, _vec), axis=0)
-        return new_vector
-    def intra_pad(self, vector, _Max_dim):
-        _vec = torch.zeros(_Max_dim - len(vector))
-        # if _Max_dim - len(vector) >= 0:
-        #     _vec = torch.zeros(_Max_dim - len(vector))
-        # else:
-        #     print("Error: Negative dimension encountered.")
-        #     #exit()
-        #     _vec = torch.zeros(0)
-        #     return vector
+        rec_atom_indices_list = []
+        lig_atom_indices_list = []
+        all_selected_rec = []
+        all_selected_lig = []
 
-        #     #_vec = torch.zeros(_Max_dim - len(vector))
-        # #print("success")
-        # #print("_Max_dim", _Max_dim)
-        # #print("len(vector)", len(vector))
-        # #_vec = torch.zeros(_Max_dim - len(vector))
-        # new_vector = torch.cat((vector, _vec), axis=0)
+        max_len = 0
+        for each_dist in self.dist:  # (Nrec, Alig)
+            rec_idx, lig_idx = torch.where(each_dist <= 8)
+            rec_list = rec_idx.tolist()
+            lig_list = lig_idx.tolist()
 
-        #_vec = torch.zeros(_Max_dim - len(vector))
-        new_vector = torch.cat((vector, _vec), axis=0)
-        return new_vector
+            rec_atom_indices_list.append(rec_list)
+            lig_atom_indices_list.append(lig_list)
 
-    def _prepare_data(self):
-        lig_type=list(set(self.updated_lig_heavy_atoms_xs_types))
-        rec_type = list(set(self.rec_heavy_atoms_xs_types))
-        # print('updated_lig_heavy_atoms_xs_types',len(self.updated_lig_heavy_atoms_xs_types))
-        # print('self.rec_heavy_atoms_xs_types',len(self.rec_heavy_atoms_xs_types))
-        # print('lig_type:',lig_type)
-        # print('rec_type:', rec_type)
-        # print('rec_type len：',len(rec_type))
-        t0 = time.time()
-        rec_atom_indices_list = []  # [[]]
-        lig_atom_indices_list = []  # [[]]
-        all_selected_rec_atom_indices = []
-        all_selected_lig_atom_indices = []
+            all_selected_rec += rec_list
+            all_selected_lig += lig_list
 
-        _Max_dim = 0
-        for each_dist in self.dist:
-            each_rec_atom_indices, each_lig_atom_indices = torch.where(each_dist <= 8)
-            rec_indices_cpu = each_rec_atom_indices.detach().cpu()
-            lig_indices_cpu = each_lig_atom_indices.detach().cpu()
+            if len(rec_list) > max_len:
+                max_len = len(rec_list)
 
-            rec_indices_list = rec_indices_cpu.tolist()
-            lig_indices_list = lig_indices_cpu.tolist()
+        all_selected_rec = sorted(set(all_selected_rec))
+        all_selected_lig = sorted(set(all_selected_lig))
 
-            rec_atom_indices_list.append(rec_indices_list)
-            lig_atom_indices_list.append(lig_indices_list)
-            all_selected_rec_atom_indices += rec_indices_list
-            all_selected_lig_atom_indices += lig_indices_list
-
-            if len(each_rec_atom_indices) > _Max_dim:
-                _Max_dim = len(each_rec_atom_indices)
-
-        # print('rec_atom_indices_list',rec_atom_indices_list)
-        # print('lig_atom_indices_list',lig_atom_indices_list)
-        all_selected_rec_atom_indices = list(set(all_selected_rec_atom_indices))
-        all_selected_lig_atom_indices = list(set(all_selected_lig_atom_indices))
-        # print('all_selected_rec_atom_indices',all_selected_rec_atom_indices)
-        # print('all_selected_lig_atom_indices',all_selected_lig_atom_indices)
-        # exit()
-
-        # Update the xs atom type of heavy atoms for receptor.
-        # t1 = time.time()
-        update_rec_xs = getattr(self.receptor, 'update_rec_xs', None)
+        # 수용체 XS 타입 업데이트(있으면)
+        update_rec_xs = getattr(self.receptor, "update_rec_xs", None)
         if callable(update_rec_xs):
-            for i in all_selected_rec_atom_indices:
-                i = int(i)
-                try:
-                    series = self.rec_index_to_series_dict[i]
-                except (KeyError, TypeError):
-                    series = None
-                residue_index = None
-                if i < len(self.heavy_atoms_residues_indices):
-                    residue_index = self.heavy_atoms_residues_indices[i]
-                update_rec_xs(self.rec_heavy_atoms_xs_types[i], i, series, residue_index)
-        t2 = time.time()
-        # print('self.rec_heavy_atoms_xs_types',self.rec_heavy_atoms_xs_types)
-        # print("cost time in update xs:", time.time() - t1)
+            for i in all_selected_rec:
+                i_int = int(i)
+                series = self.rec_index_to_series_dict.get(i_int, None)
+                residue_index = (
+                    self.heavy_atoms_residues_indices[i_int]
+                    if i_int < len(self.heavy_atoms_residues_indices)
+                    else None
+                )
+                update_rec_xs(self.rec_heavy_atoms_xs_types[i_int], i_int, series, residue_index)
 
-        # is_hydrophobic
-        rec_atom_is_hydrophobic_dict = dict(zip(all_selected_rec_atom_indices,
-                                                np.array(list(map(self.is_hydrophobic, all_selected_rec_atom_indices,
-                                                                  [False] * len(all_selected_rec_atom_indices)))) * 1.))
-        # print('rec_atom_is_hydrophobic_dict',rec_atom_is_hydrophobic_dict)
-        lig_atom_is_hydrophobic_dict = dict(zip(all_selected_lig_atom_indices,
-                                                np.array(list(map(self.is_hydrophobic, all_selected_lig_atom_indices,
-                                                                  [True] * len(all_selected_lig_atom_indices)))) * 1.))
-        # print('lig_atom_is_hydrophobic_dict ',lig_atom_is_hydrophobic_dict )
-        # is_hbdonor
-        rec_atom_is_hbdonor_dict = dict(zip(all_selected_rec_atom_indices,
-                                            np.array(list(map(self.is_hbdonor, all_selected_rec_atom_indices,
-                                                              [False] * len(all_selected_rec_atom_indices)))) * 1.))
-        lig_atom_is_hbdonor_dict = dict(zip(all_selected_lig_atom_indices,
-                                            np.array(list(map(self.is_hbdonor, all_selected_lig_atom_indices,
-                                                              [True] * len(all_selected_lig_atom_indices)))) * 1.))
+        # 속성 마스크와 vdw 합 생성
+        rec_is_hydro = {i: float(self.is_hydrophobic(i, is_lig=False)) for i in all_selected_rec}
+        lig_is_hydro = {i: float(self.is_hydrophobic(i, is_lig=True)) for i in all_selected_lig}
 
-        # is_hbacceptor
-        rec_atom_is_hbacceptor_dict = dict(zip(all_selected_rec_atom_indices,
-                                               np.array(list(map(self.is_hbacceptor, all_selected_rec_atom_indices,
-                                                                 [False] * len(all_selected_rec_atom_indices)))) * 1.))
-        lig_atom_is_hbacceptor_dict = dict(zip(all_selected_lig_atom_indices,
-                                               np.array(list(map(self.is_hbacceptor, all_selected_lig_atom_indices,
-                                                                 [True] * len(all_selected_lig_atom_indices)))) * 1.))
-        td = time.time()
+        rec_is_donor = {i: float(self.is_hbdonor(i, is_lig=False)) for i in all_selected_rec}
+        lig_is_donor = {i: float(self.is_hbdonor(i, is_lig=True)) for i in all_selected_lig}
 
-        rec_lig_is_hydrophobic = []
-        rec_lig_is_hbond = []
-        rec_lig_atom_vdw_sum = []
-        for each_rec_indices, each_lig_indices in zip(rec_atom_indices_list,
-                                                      lig_atom_indices_list):
+        rec_is_accept = {i: float(self.is_hbacceptor(i, is_lig=False)) for i in all_selected_rec}
+        lig_is_accept = {i: float(self.is_hbacceptor(i, is_lig=True)) for i in all_selected_lig}
 
-            r_hydro = []
-            l_hydro = []
-            r_hbdonor = []
-            l_hbdonor = []
-            r_hbacceptor = []
-            l_hbacceptor = []
+        hydro_rows = []
+        hbond_rows = []
+        vdw_rows = []
 
-            r_vdw = []
-            l_vdw = []
-            # t9=time.time()
-            for r_index, l_index in zip(each_rec_indices, each_lig_indices):
-                # len(each_rec_indices)约2000
-                # is hydrophobic
-                r_hydro.append(rec_atom_is_hydrophobic_dict[r_index])
-                l_hydro.append(lig_atom_is_hydrophobic_dict[l_index])
+        for rec_list, lig_list in zip(rec_atom_indices_list, lig_atom_indices_list):
+            # 속성 벡터들(길이 K)
+            r_hydro = torch.tensor([rec_is_hydro[i] for i in rec_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            l_hydro = torch.tensor([lig_is_hydro[i] for i in lig_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
 
-                # is hbdonor & hbacceptor
-                r_hbdonor.append(rec_atom_is_hbdonor_dict[r_index])
-                l_hbdonor.append(lig_atom_is_hbdonor_dict[l_index])
+            r_donor = torch.tensor([rec_is_donor[i] for i in rec_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            l_donor = torch.tensor([lig_is_donor[i] for i in lig_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
 
-                r_hbacceptor.append(rec_atom_is_hbacceptor_dict[r_index])
-                l_hbacceptor.append(lig_atom_is_hbacceptor_dict[l_index])
+            r_accept = torch.tensor([rec_is_accept[i] for i in rec_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            l_accept = torch.tensor([lig_is_accept[i] for i in lig_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
 
-                # vdw
-                r_vdw.append(self.vdw_radii_dict[self.rec_heavy_atoms_xs_types[r_index]])
-                l_vdw.append(self.vdw_radii_dict[self.updated_lig_heavy_atoms_xs_types[l_index]])
+            # 패딩
+            r_hydro = self._pad(r_hydro, max_len)
+            l_hydro = self._pad(l_hydro, max_len)
+            hydro_rows.append((r_hydro * l_hydro).unsqueeze(0))
 
-            r_hydro = self._pad(torch.from_numpy(np.array(r_hydro)), _Max_dim)
-            l_hydro = self._pad(torch.from_numpy(np.array(l_hydro)), _Max_dim)
+            r_donor = self._pad(r_donor, max_len)
+            l_donor = self._pad(l_donor, max_len)
+            r_accept = self._pad(r_accept, max_len)
+            l_accept = self._pad(l_accept, max_len)
+            is_hbond = ((r_donor * l_accept + r_accept * l_donor) > 0).to(device_dtype_ref.dtype)
+            hbond_rows.append(is_hbond.unsqueeze(0))
 
-            rec_lig_is_hydrophobic.append(r_hydro * l_hydro.reshape(1, -1))
-            # print('rec_lig_is_hydrophobic', rec_lig_is_hydrophobic[0].shape)
-            # exit()
+            # VdW 합
+            vdw_sum = [
+                self.vdw_radii_dict[self.rec_heavy_atoms_xs_types[r]] + self.vdw_radii_dict[self.updated_lig_heavy_atoms_xs_types[l]]
+                for r, l in zip(rec_list, lig_list)
+            ]
+            vdw_vec = torch.tensor(vdw_sum, device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            vdw_rows.append(self._pad(vdw_vec, max_len).unsqueeze(0))
 
-            # hbond
-            r_hbdonor = self._pad(torch.from_numpy(np.array(r_hbdonor)), _Max_dim)
-            l_hbdonor = self._pad(torch.from_numpy(np.array(l_hbdonor)), _Max_dim)
+        self.rec_lig_is_hydrophobic = torch.cat(hydro_rows, dim=0) if hydro_rows else device_dtype_ref.new_zeros((self.number_of_poses, 0))
+        self.rec_lig_is_hbond = torch.cat(hbond_rows, dim=0) if hbond_rows else device_dtype_ref.new_zeros((self.number_of_poses, 0))
+        self.rec_lig_atom_vdw_sum = torch.cat(vdw_rows, dim=0) if vdw_rows else device_dtype_ref.new_zeros((self.number_of_poses, 0))
 
-            r_hbacceptor = self._pad(torch.from_numpy(np.array(r_hbacceptor)), _Max_dim)
-            l_hbacceptor = self._pad(torch.from_numpy(np.array(l_hbacceptor)), _Max_dim)
-            _is_hbond = ((r_hbdonor * l_hbacceptor + r_hbacceptor * l_hbdonor) > 0) * 1.
-            rec_lig_is_hbond.append(_is_hbond.reshape(1, -1))
-
-            # rec-lig vdw
-            rec_lig_atom_vdw_sum.append(
-                self._pad(torch.from_numpy(np.array(r_vdw) + \
-                                           np.array(l_vdw)), _Max_dim) \
-                    .reshape(1, -1))
-
-        self.rec_lig_is_hydrophobic = torch.cat(rec_lig_is_hydrophobic, axis=0)
-        self.rec_lig_is_hbond = torch.cat(rec_lig_is_hbond, axis=0)
-        self.rec_lig_atom_vdw_sum = torch.cat(rec_lig_atom_vdw_sum, axis=0)
-
-        tt = time.time()
-
-        # vina dist
-        vina_dist_list = []
-
-        for _num, dist in enumerate(self.dist):
-            dist = dist * ((dist <= 8) * 1.)
-            l = len(dist[dist != 0])
-            vina_dist_list.append(self._pad(dist[dist != 0], _Max_dim).reshape(1, -1))
-
-        self.vina_dist = torch.cat(vina_dist_list, axis=0)
-        t3 = time.time()
-        #print("cost time in prepare data:", t3 - t0)
+        # Vina용 거리 벡터(<=8Å, 0 제외) 추출 + 패딩
+        vina_list = []
+        for each_dist in self.dist:
+            mask = (each_dist <= 8) & (each_dist > 0)
+            vals = each_dist[mask]
+            vina_list.append(self._pad(vals, max_len).unsqueeze(0))
+        self.vina_dist = torch.cat(vina_list, dim=0)
 
         return self
 
-    def _prepare_data_intra(self):
-        lig_type = list(set(self.updated_lig_heavy_atoms_xs_types))
-        rec_type = lig_type
-        # print('updated_lig_heavy_atoms_xs_types',len(self.updated_lig_heavy_atoms_xs_types))
-        # print('self.rec_heavy_atoms_xs_types',len(self.rec_heavy_atoms_xs_types))
-        # print('lig_type:',lig_type)
-        # print('rec_type:', rec_type)
-        # print('rec_type len：',len(rec_type))
-        #t0 = time.time()
-        rec_atom_indices_list = []  # [[]]
-        lig_atom_indices_list = []  # [[]]
-        all_selected_rec_atom_indices = []
-        all_selected_lig_atom_indices = []
+    # -------------------------- 데이터 준비(분자 내부) --------------------------
+    def _prepare_data_intra(self) -> "VinaSFTorch":
+        device_dtype_ref = _like_of(self.intra_dist, self.pose_heavy_atoms_coords)
 
-        _Max_dim = 0
+        rec_atom_indices_list = []
+        lig_atom_indices_list = []
+        all_selected_rec = []
+        all_selected_lig = []
+
+        max_len = 0
+        for each_dist in self.intra_dist:  # (K,) 각 pose마다 pair 거리
+            idx = torch.where(each_dist <= 8)[0].tolist()
+            # 해당 idx는 self.ligand.intra_interacting_pairs의 인덱스
+            rec_list = [self.ligand.intra_interacting_pairs[i][0] for i in idx]
+            lig_list = [self.ligand.intra_interacting_pairs[i][1] for i in idx]
+
+            rec_atom_indices_list.append(rec_list)
+            lig_atom_indices_list.append(lig_list)
+            all_selected_rec += rec_list
+            all_selected_lig += lig_list
+
+            if len(rec_list) > max_len:
+                max_len = len(rec_list)
+
+        all_selected_rec = sorted(set(all_selected_rec))
+        all_selected_lig = sorted(set(all_selected_lig))
+
+        # 내부 상호작용은 모두 리간드 원자들
+        lig_is_hydro = {i: float(self.is_hydrophobic(i, is_lig=True)) for i in all_selected_lig + all_selected_rec}
+        lig_is_donor = {i: float(self.is_hbdonor(i, is_lig=True)) for i in all_selected_lig + all_selected_rec}
+        lig_is_accept = {i: float(self.is_hbacceptor(i, is_lig=True)) for i in all_selected_lig + all_selected_rec}
+
+        hydro_rows = []
+        hbond_rows = []
+        vdw_rows = []
+
+        for rec_list, lig_list in zip(rec_atom_indices_list, lig_atom_indices_list):
+            r_hydro = torch.tensor([lig_is_hydro[i] for i in rec_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            l_hydro = torch.tensor([lig_is_hydro[i] for i in lig_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+
+            r_donor = torch.tensor([lig_is_donor[i] for i in rec_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            l_donor = torch.tensor([lig_is_donor[i] for i in lig_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+
+            r_accept = torch.tensor([lig_is_accept[i] for i in rec_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            l_accept = torch.tensor([lig_is_accept[i] for i in lig_list], device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+
+            r_hydro = self._pad(r_hydro, max_len)
+            l_hydro = self._pad(l_hydro, max_len)
+            hydro_rows.append((r_hydro * l_hydro).unsqueeze(0))
+
+            r_donor = self._pad(r_donor, max_len)
+            l_donor = self._pad(l_donor, max_len)
+            r_accept = self._pad(r_accept, max_len)
+            l_accept = self._pad(l_accept, max_len)
+            is_hbond = ((r_donor * l_accept + r_accept * l_donor) > 0).to(device_dtype_ref.dtype)
+            hbond_rows.append(is_hbond.unsqueeze(0))
+
+            vdw_sum = [
+                self.vdw_radii_dict[self.updated_lig_heavy_atoms_xs_types[r]] + self.vdw_radii_dict[self.updated_lig_heavy_atoms_xs_types[l]]
+                for r, l in zip(rec_list, lig_list)
+            ]
+            vdw_vec = torch.tensor(vdw_sum, device=device_dtype_ref.device, dtype=device_dtype_ref.dtype)
+            vdw_rows.append(self._pad(vdw_vec, max_len).unsqueeze(0))
+
+        self.intra_rec_lig_is_hydrophobic = torch.cat(hydro_rows, dim=0) if hydro_rows else device_dtype_ref.new_zeros((self.number_of_poses, 0))
+        self.intra_rec_lig_is_hbond = torch.cat(hbond_rows, dim=0) if hbond_rows else device_dtype_ref.new_zeros((self.number_of_poses, 0))
+        self.intra_rec_lig_atom_vdw_sum = torch.cat(vdw_rows, dim=0) if vdw_rows else device_dtype_ref.new_zeros((self.number_of_poses, 0))
+
+        # intra용 거리 벡터
+        vina_list = []
         for each_dist in self.intra_dist:
-            #print("each_dist ",each_dist.shape )
-            #each_rec_atom_indices, each_lig_atom_indices = torch.where((each_dist>0)&(each_dist <= 8))
-            idx = torch.where((each_dist <= 8))[0]
-            #print("idx",idx)
-          
-            #each_rec_atom_indices = [pair[0] for i, pair in enumerate(self.ligand.intra_interacting_pairs) if i in idx]
-            #each_lig_atom_indices = [pair[1] for i, pair in enumerate(self.ligand.intra_interacting_pairs) if i in idx]
-
-            each_rec_atom_indices = [self.ligand.intra_interacting_pairs[i][0] for i in idx.tolist()]
-            each_lig_atom_indices = [self.ligand.intra_interacting_pairs[i][1] for i in idx.tolist()]
-            #print("each_rec_atom_indices",each_rec_atom_indices)
-            #print("each_lig_atom_indices",each_lig_atom_indices)
-            rec_atom_indices_list.append(each_rec_atom_indices)
-            lig_atom_indices_list.append(each_lig_atom_indices)
-            all_selected_rec_atom_indices += each_rec_atom_indices
-            all_selected_lig_atom_indices += each_lig_atom_indices
-            #print("len(each_rec_atom_indices)",len(each_rec_atom_indices))
-            #print("len(each_lig_atom_indices)", len(each_lig_atom_indices))
-            if len(each_rec_atom_indices) > _Max_dim:
-                _Max_dim = len(each_rec_atom_indices)
-                #_Max_dim = each_dist.shape[0]*each_dist.shape[1]
-
-        # print('rec_atom_indices_list',rec_atom_indices_list)
-        # print('lig_atom_indices_list',lig_atom_indices_list)
-        all_selected_rec_atom_indices = list(set(all_selected_rec_atom_indices))
-        all_selected_lig_atom_indices = list(set(all_selected_lig_atom_indices))
-        # print('all_selected_rec_atom_indices',all_selected_rec_atom_indices)
-        # print('all_selected_lig_atom_indices',all_selected_lig_atom_indices)
-        # exit()
-
-        # Update the xs atom type of heavy atoms for receptor.
-        # t1 = time.time()
-        # for i in all_selected_rec_atom_indices:
-        #     i = int(i)
-        #     self.receptor.update_rec_xs(self.rec_heavy_atoms_xs_types[i], i,
-        #                                 self.rec_index_to_series_dict[i],
-        #                                 self.heavy_atoms_residues_indices[i])
-        t2 = time.time()
-        # print('self.rec_heavy_atoms_xs_types',self.rec_heavy_atoms_xs_types)
-        # print("cost time in update xs:", time.time() - t1)
-
-        # is_hydrophobic
-        rec_atom_is_hydrophobic_dict = dict(zip(all_selected_rec_atom_indices,
-                                                np.array(list(map(self.is_hydrophobic, all_selected_rec_atom_indices,
-                                                                  [True] * len(all_selected_rec_atom_indices)))) * 1.))
-        # print('rec_atom_is_hydrophobic_dict',rec_atom_is_hydrophobic_dict)
-        lig_atom_is_hydrophobic_dict = dict(zip(all_selected_lig_atom_indices,
-                                                np.array(list(map(self.is_hydrophobic, all_selected_lig_atom_indices,
-                                                                  [True] * len(all_selected_lig_atom_indices)))) * 1.))
-        # print('lig_atom_is_hydrophobic_dict ',lig_atom_is_hydrophobic_dict )
-        # is_hbdonor
-        rec_atom_is_hbdonor_dict = dict(zip(all_selected_rec_atom_indices,
-                                            np.array(list(map(self.is_hbdonor, all_selected_rec_atom_indices,
-                                                              [True] * len(all_selected_rec_atom_indices)))) * 1.))
-        lig_atom_is_hbdonor_dict = dict(zip(all_selected_lig_atom_indices,
-                                            np.array(list(map(self.is_hbdonor, all_selected_lig_atom_indices,
-                                                              [True] * len(all_selected_lig_atom_indices)))) * 1.))
-
-        # is_hbacceptor
-        rec_atom_is_hbacceptor_dict = dict(zip(all_selected_rec_atom_indices,
-                                               np.array(list(map(self.is_hbacceptor, all_selected_rec_atom_indices,
-                                                                 [True] * len(all_selected_rec_atom_indices)))) * 1.))
-        lig_atom_is_hbacceptor_dict = dict(zip(all_selected_lig_atom_indices,
-                                               np.array(list(map(self.is_hbacceptor, all_selected_lig_atom_indices,
-                                                                 [True] * len(all_selected_lig_atom_indices)))) * 1.))
-        td = time.time()
-    
-        rec_lig_is_hydrophobic = []
-        rec_lig_is_hbond = []
-        rec_lig_atom_vdw_sum = []
-        for each_rec_indices, each_lig_indices in zip(rec_atom_indices_list,
-                                                      lig_atom_indices_list):
-
-            r_hydro = []
-            l_hydro = []
-            r_hbdonor = []
-            l_hbdonor = []
-            r_hbacceptor = []
-            l_hbacceptor = []
-
-            r_vdw = []
-            l_vdw = []
-            # t9=time.time()
-            for r_index, l_index in zip(each_rec_indices, each_lig_indices):
-                # len(each_rec_indices)约2000
-                # is hydrophobic
-                r_hydro.append(rec_atom_is_hydrophobic_dict[r_index])
-                l_hydro.append(lig_atom_is_hydrophobic_dict[l_index])
-
-                # is hbdonor & hbacceptor
-                r_hbdonor.append(rec_atom_is_hbdonor_dict[r_index])
-                l_hbdonor.append(lig_atom_is_hbdonor_dict[l_index])
-
-                r_hbacceptor.append(rec_atom_is_hbacceptor_dict[r_index])
-                l_hbacceptor.append(lig_atom_is_hbacceptor_dict[l_index])
-
-                # vdw
-                r_vdw.append(self.vdw_radii_dict[self.updated_lig_heavy_atoms_xs_types[r_index]])
-                l_vdw.append(self.vdw_radii_dict[self.updated_lig_heavy_atoms_xs_types[l_index]])
-
-            r_hydro = self.intra_pad(torch.from_numpy(np.array(r_hydro)), _Max_dim)
-            l_hydro = self.intra_pad(torch.from_numpy(np.array(l_hydro)), _Max_dim)
-
-            rec_lig_is_hydrophobic.append(r_hydro * l_hydro.reshape(1, -1))
-            # print('rec_lig_is_hydrophobic', rec_lig_is_hydrophobic[0].shape)
-            # exit()
-
-            # hbond
-            r_hbdonor = self.intra_pad(torch.from_numpy(np.array(r_hbdonor)), _Max_dim)
-            l_hbdonor = self.intra_pad(torch.from_numpy(np.array(l_hbdonor)), _Max_dim)
-
-            r_hbacceptor = self.intra_pad(torch.from_numpy(np.array(r_hbacceptor)), _Max_dim)
-            l_hbacceptor = self.intra_pad(torch.from_numpy(np.array(l_hbacceptor)), _Max_dim)
-            _is_hbond = ((r_hbdonor * l_hbacceptor + r_hbacceptor * l_hbdonor) > 0) * 1.
-            rec_lig_is_hbond.append(_is_hbond.reshape(1, -1))
-
-            # rec-lig vdw
-            rec_lig_atom_vdw_sum.append(
-                self.intra_pad(torch.from_numpy(np.array(r_vdw) + \
-                                           np.array(l_vdw)), _Max_dim) \
-                    .reshape(1, -1))
-
-        self.intra_rec_lig_is_hydrophobic = torch.cat(rec_lig_is_hydrophobic, axis=0)
-        self.intra_rec_lig_is_hbond = torch.cat(rec_lig_is_hbond, axis=0)
-        self.intra_rec_lig_atom_vdw_sum = torch.cat(rec_lig_atom_vdw_sum, axis=0)
-
-        tt = time.time()
-
-        # vina dist
-        vina_dist_list = []
-
-        for _num, dist in enumerate(self.intra_dist):
-            dist = dist * ((dist <= 8) * 1.)
-            #dist = dist * ((dist > 0) * 1.)
-            l = len(dist[dist != 0])
-            vina_dist_list.append(self.intra_pad(dist[dist != 0], _Max_dim).reshape(1, -1))
-
-        self.intra_vina_dist = torch.cat(vina_dist_list, axis=0)
-        t3 = time.time()
-        # print("cost time in prepare data:", t3 - t0)
+            vals = each_dist[each_dist > 0]  # 0 제외
+            vina_list.append(self._pad(vals, max_len).unsqueeze(0))
+        self.intra_vina_dist = torch.cat(vina_list, dim=0) if vina_list else device_dtype_ref.new_zeros((self.number_of_poses, 0))
 
         return self
 
-    def scoring(self):
-        '''# update heavy atom coordinates
-        if self.ligand.cnfrs_ is not None:
-            self.ligand.cnfr2xyz(self.ligand.cnfrs_)
-
-        if self.receptor.cnfrs_ is not None:
-            self.receptor.cnfrs2xyz(self.receptor.cnfrs_)'''
-        
-
+    # -------------------------- 점수 계산 --------------------------
+    def scoring(self) -> torch.Tensor:
         t1 = time.time()
-        # make distance matrix
         self.generate_pldist_mtrx()
-        #t2 = time.time()
-        #  prepare data after distance matrix is defined
         self._prepare_data()
-        #t3 = time.time()
-        vina = VinaScoreCore(self.vina_dist,
-                             self.rec_lig_is_hydrophobic,
-                             self.rec_lig_is_hbond,
-                             self.rec_lig_atom_vdw_sum)
 
-
+        vina = VinaScoreCore(self.vina_dist, self.rec_lig_is_hydrophobic, self.rec_lig_is_hbond, self.rec_lig_atom_vdw_sum)
         try:
             vina_inter_term = vina.process()
+            self.vina_inter_energy = vina_inter_term.reshape(-1, 1)
+        except Exception:
+            # 실패 시 큰 값으로 fallback
+            like = _like_of(self.pose_heavy_atoms_coords)
+            self.vina_inter_energy = torch.full((self.number_of_poses, 1), 99.99, device=like.device, dtype=like.dtype)
 
-            # self.vina_inter_energy = vina_inter_term / (
-            #         1 + 0.05846 * (self.ligand.active_torsion \
-            #                        + 0.5 * self.ligand.inactive_torsion))
-            self.vina_inter_energy = vina_inter_term
-
-            self.vina_inter_energy = self.vina_inter_energy.reshape(-1, 1)
-            #print('vina_inter_term', self.vina_inter_energy)
-        except:
-            self.vina_inter_energy = torch.tensor([[99.99]], requires_grad=True)
-
-            #self.vina_inter_energy = torch.Tensor([[99.99, ]]).requires_grad()
-        #t77 = time.time()
-        #vina_intra_term2 = self.cal_intra_repulsion()
-        #t88 = time.time()
-        #print("00 time",t8-t7)
-        #print("00 vina_intra_term:", vina_intra_term2)
-
-
-        #t4 = time.time()
-        #vina_intra_term=torch.tensor([[99.99]], requires_grad=True)
         vina_intra_term = torch.zeros_like(self.vina_inter_energy)
         if self.lig_intra_interacting_pairs:
             try:
@@ -952,69 +515,13 @@ class VinaSFTorch(torch.nn.Module):
                 vina_intra_term = vina_intra.process().reshape(-1, 1)
             except Exception:
                 vina_intra_term = torch.zeros_like(self.vina_inter_energy)
-        # #print("11 self.vina_intra_energy",vina_intra_term)
-        # #else:
-        #vina_intra_term = self.cal_intra_repulsion().reshape(-1, 1)
-        # print("22 intra", vina_intra_term2)
-        #vina_intra_term = self.cal_intra_repulsion()
 
-        #vina_intra_term = self.cal_intra_repulsion()
-        #t5=time.time()
-        # print("11 time:", t5 - t4)
-        # print("intra_mtrx time:", t8 - t4)
-        # print("prepare time:", t9 - t8)
-        # print("11 vina_intra_term",vina_intra_term)
+        # 토션 보정
+        torsion = 1 + 0.05846 * (self.ligand.active_torsion + 0.5 * self.ligand.inactive_torsion)
+        return (self.vina_inter_energy + vina_intra_term) / torsion
 
-        # if self.flag<12:
-        #vina_intra_term = self.cal_intra_repulsion().reshape(-1, 1)
-        #   self.flag+=1
-        # t5 = time.time()
-        # print("22 vina_intra_term", vina_intra_term)
-        #print("11 time:", t5 - t4)
-        #t6 = time.time()
-
-
-
-
-        #vina_intra_term = self.cal_intra_repulsion()
-        #t7 = time.time()
-        #print("22 time:", t7-t6)
-        #exit()
-        # print("vina_intra_term ",vina_intra_term )
-        #print("self.vina_inter_energy ", self.vina_inter_energy )
-        #print('vina_intra_term', vina_intra_term)
-        # except:
-        #     vina_intra_term = torch.Tensor([[0.0, ]])
-        # print("inter and intra", self.vina_inter_energy, vina_intra_term)
-        # t5 = time.time()
-        #a=self.vina_inter_energy + vina_intra_term
-        #print("cost time in make distance matrix:", t2-t1)
-        #print("cost time in prepare data:", t3 - t2)
-        # print("cost time in calcuate inter energy:", t77 - t1)
-        # print("cost time in calcuate intra energy:", t5 - t4)
-        # print("cost time in calcuate  old  intra:", t88-t77)
-        #print("score",(self.vina_inter_energy + vina_intra_term))
-        return (self.vina_inter_energy + vina_intra_term)/ ( 1 + 0.05846 * (self.ligand.active_torsion + 0.5 * self.ligand.inactive_torsion))
-
-    def score_and_gradient(
-        self, ligand_coords: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute the Vina score and gradient for the provided coordinates.
-
-        Parameters
-        ----------
-        ligand_coords:
-            Tensor containing ligand heavy atom coordinates shaped
-            ``(N, A, 3)`` for ``N`` poses.
-
-        Returns
-        -------
-        Tuple[torch.Tensor, torch.Tensor]
-            The first element is the score tensor returned by :meth:`scoring`
-            and the second element contains the gradient with respect to the
-            provided coordinates (matching the input shape).
-        """
-
+    def score_and_gradient(self, ligand_coords: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """입력 좌표(N, A, 3)에 대한 스코어와 그래디언트를 반환."""
         if self.ligand is None:
             raise ValueError("Ligand must be initialised before scoring.")
 
@@ -1034,63 +541,104 @@ class VinaSFTorch(torch.nn.Module):
         self.pose_heavy_atoms_coords = detached
 
         return score.detach(), gradient.detach().view_as(coords)
-       
+
+    # -------------------------- 원자 타입/속성 --------------------------
+    def get_vdw_radii(self, xs: str) -> float:
+        return self.vdw_radii_dict[xs]
+
+    def get_vina_dist(self, r_index: int, l_index: int) -> torch.Tensor:
+        return self.dist[:, r_index, l_index]
+
+    def get_vina_rec_xs(self, index: int) -> str:
+        return self.rec_heavy_atoms_xs_types[index]
+
+    def get_vina_lig_xs(self, index: int) -> str:
+        return self.updated_lig_heavy_atoms_xs_types[index]
+
+    def is_hydrophobic(self, index: int, is_lig: bool) -> bool:
+        atom_xs = (
+            self.updated_lig_heavy_atoms_xs_types[index]
+            if is_lig
+            else self.rec_heavy_atoms_xs_types[index]
+        )
+        return atom_xs in ["C_H", "F_H", "Cl_H", "Br_H", "I_H"]
+
+    def is_hbdonor(self, index: int, is_lig: bool = False) -> bool:
+        atom_xs = (
+            self.updated_lig_heavy_atoms_xs_types[index]
+            if is_lig
+            else self.rec_heavy_atoms_xs_types[index]
+        )
+        return atom_xs in ["N_D", "N_DA", "O_DA", "Met_D"]
+
+    def is_hbacceptor(self, index: int, is_lig: bool = False) -> bool:
+        atom_xs = (
+            self.updated_lig_heavy_atoms_xs_types[index]
+            if is_lig
+            else self.rec_heavy_atoms_xs_types[index]
+        )
+        return atom_xs in ["N_A", "N_DA", "O_A", "O_DA"]
+
+    # -------------------------- (선택) 반발 항 계산 유틸 --------------------------
+    def cal_inter_repulsion(self, dist: torch.Tensor, vdw_sum: torch.Tensor) -> torch.Tensor:
+        """vdW 합보다 짧은 거리에서의 상호 반발 항."""
+        mask = (dist < vdw_sum).to(dist.dtype)  # (N, K)
+        mask_sum = torch.sum(mask, dim=1)
+        zero_idx = torch.where(mask_sum == 0)[0]
+        if zero_idx.numel() > 0:
+            # 0으로 떨어지는 분모 방지(의미 없는 큰 값으로 채움)
+            mask[zero_idx, 0] = dist[zero_idx, 0].pow(20)
+
+        term = torch.sum((mask * dist + (mask == 0).to(dist.dtype)).pow(-self.repulsive_), dim=1)
+        term -= torch.sum(mask * dist, dim=1)
+        self.inter_repulsive_term = term.reshape(-1, 1)
+        return self.inter_repulsive_term
 
 
-class VinaScoreCore(object):
+class VinaScoreCore:
+    """Vina 에너지 항 계산의 코어(한 번 준비된 행렬에서 벡터화 계산)."""
 
-    def __init__(self, dist_matrix, rec_lig_is_hydrophobic, rec_lig_is_hbond, rec_lig_atom_vdw_sum):
-        """
-        Args:
-            dist_matrix [N, M]: the distance matrix with less than 8 angstroms.
-            N is the number of poses,
-        M is the number of rec-lig atom pairs less than 8 Angstroms in each pose.
-
-        Returns:
-            final_inter_score [N, 1]
-
-        """
-
+    def __init__(self, dist_matrix: torch.Tensor, rec_lig_is_hydrophobic: torch.Tensor,
+                 rec_lig_is_hbond: torch.Tensor, rec_lig_atom_vdw_sum: torch.Tensor) -> None:
         self.dist_matrix = dist_matrix
         self.rec_lig_is_hydro = rec_lig_is_hydrophobic
         self.rec_lig_is_hb = rec_lig_is_hbond
         self.rec_lig_atom_vdw_sum = rec_lig_atom_vdw_sum
 
-    def score_function(self):
-        # t = time.time()
-        #print("dist_matrix:", self.dist_matrix.shape)
-        #print("rec_lig_atom_vdw_sum:", self.rec_lig_atom_vdw_sum.shape)
+    def score_function(self) -> torch.Tensor:
         d_ij = self.dist_matrix - self.rec_lig_atom_vdw_sum
-        # print("d_ij:", d_ij.shape)
-        Gauss_1 = torch.sum(torch.exp(- torch.pow(d_ij / 0.5, 2)), axis=1) - torch.sum((d_ij == 0) * 1., axis=1)
-        Gauss_2 = torch.sum(torch.exp(- torch.pow((d_ij - 3) / 2, 2)), axis=1) - \
-                  torch.sum((d_ij == 0) * 1. * torch.exp(torch.tensor(-1 * 9 / 4)), axis=1)
 
-        # Repulsion
-        Repulsion = torch.sum(torch.pow(((d_ij < 0) * d_ij), 2), axis=1)
-        # print("Repulsion:", Repulsion)
+        # 가우시안 항
+        gauss1 = torch.sum(torch.exp(-((d_ij / 0.5) ** 2)), dim=1) - torch.sum((d_ij == 0).to(d_ij.dtype), dim=1)
+        # exp(-9/4)는 상수(≈ e^-2.25)
+        exp_const = math.exp(-9.0 / 4.0)
+        gauss2 = torch.sum(torch.exp(-(((d_ij - 3.0) / 2.0) ** 2)), dim=1) - torch.sum(
+            (d_ij == 0).to(d_ij.dtype) * exp_const, dim=1
+        )
 
-        # Hydrophobic
-        Hydro_1 = self.rec_lig_is_hydro * (d_ij <= 0.5) * 1.
+        # 반발(거리 부족)
+        repulsion = torch.sum(torch.where(d_ij < 0, d_ij, d_ij.new_zeros(1)).pow(2), dim=1)
 
-        Hydro_2_condition = self.rec_lig_is_hydro * (d_ij > 0.5) * (d_ij < 1.5) * 1.
-        Hydro_2 = 1.5 * Hydro_2_condition - Hydro_2_condition * d_ij
+        # 소수성
+        hydro1 = self.rec_lig_is_hydro * (d_ij <= 0.5).to(d_ij.dtype)
+        hydro2_mask = self.rec_lig_is_hydro * ((d_ij > 0.5) & (d_ij < 1.5)).to(d_ij.dtype)
+        hydro2 = 1.5 * hydro2_mask - hydro2_mask * d_ij
+        hydrophobic = torch.sum(hydro1 + hydro2, dim=1)
 
-        Hydrophobic = torch.sum(Hydro_1 + Hydro_2, axis=1)
-        # print("Hydro:", Hydrophobic)
+        # H-결합
+        hb1 = self.rec_lig_is_hb * (d_ij <= -0.7).to(d_ij.dtype)
+        hb2 = self.rec_lig_is_hb * ((d_ij < 0) & (d_ij > -0.7)).to(d_ij.dtype) * (-d_ij) / 0.7
+        hbond = torch.sum(hb1 + hb2, dim=1)
 
-        # HBonding
-        hbond_1 = self.rec_lig_is_hb * (d_ij <= -0.7) * 1.
-        hbond_2 = self.rec_lig_is_hb * (d_ij < 0) * (d_ij > -0.7) * 1.0 * (- d_ij) / 0.7
-        HBonding = torch.sum(hbond_1 + hbond_2, axis=1)
-        # print("HB:", HBonding)
-
-        inter_energy = - 0.035579 * Gauss_1 - \
-                       0.005156 * Gauss_2 + 0.840245 * Repulsion - 0.035069 * Hydrophobic - 0.587439 * HBonding
-        # print("cost time in calculate energy:", time.time() - t)
+        # 가중 합
+        inter_energy = (
+            -0.035579 * gauss1
+            - 0.005156 * gauss2
+            + 0.840245 * repulsion
+            - 0.035069 * hydrophobic
+            - 0.587439 * hbond
+        )
         return inter_energy
 
-    def process(self):
-        final_inter_score = self.score_function()
-
-        return final_inter_score
+    def process(self) -> torch.Tensor:
+        return self.score_function()
